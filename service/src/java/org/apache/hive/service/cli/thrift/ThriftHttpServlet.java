@@ -60,7 +60,15 @@ import org.apache.hive.service.auth.HttpAuthenticationException;
 import org.apache.hive.service.auth.PasswdAuthenticationProvider;
 import org.apache.hive.service.auth.PlainSaslHelper;
 import org.apache.hive.service.auth.jwt.JWTValidator;
+import org.apache.hive.service.auth.ldap.CustomQueryFilterFactory;
+import org.apache.hive.service.auth.ldap.DirSearch;
+import org.apache.hive.service.auth.ldap.DirSearchFactory;
+import org.apache.hive.service.auth.ldap.Filter;
+import org.apache.hive.service.auth.ldap.FilterFactory;
+import org.apache.hive.service.auth.ldap.GroupFilterFactory;
 import org.apache.hive.service.auth.ldap.HttpEmptyAuthenticationException;
+import org.apache.hive.service.auth.ldap.LdapSearchFactory;
+import org.apache.hive.service.auth.ldap.UserGroupSearchFilterFactory;
 import org.apache.hive.service.auth.HttpAuthService;
 import org.apache.hive.service.auth.saml.HiveSaml2Client;
 import org.apache.hive.service.auth.saml.HiveSamlRelayStateStore;
@@ -516,7 +524,10 @@ public class ThriftHttpServlet extends TServlet {
               "unable to establish context with the service ticket " +
               "provided by the client.");
         } else {
-          return getPrincipalWithoutRealmAndHost(gssContext.getSrcName().toString());
+          String shortName = getPrincipalWithoutRealmAndHost(gssContext.getSrcName().toString());
+          LOG.debug("Kerberos user principal => shortName: {}", shortName);
+          enforceLdapFilters(shortName);
+          return shortName;
         }
       } catch (GSSException e) {
         if (gssContext != null) {
@@ -537,6 +548,94 @@ public class ThriftHttpServlet extends TServlet {
             // No-op
           }
         }
+      }
+    }
+
+    private void enforceLdapFilters(String shortName) throws HttpAuthenticationException {
+      boolean enableGroupCheck = hiveConf.getBoolVar(
+          HiveConf.ConfVars.HIVE_SERVER2_LDAP_ENABLE_GROUP_CHECK_AFTER_KERBEROS);
+      boolean allowCustomFilter = hiveConf.getBoolVar(
+          HiveConf.ConfVars.HIVE_SERVER2_LDAP_ALLOW_CUSTOM_LDAP_FILTERS_WITH_KERBEROS_AUTH);
+      if (!enableGroupCheck && !allowCustomFilter) {
+        LOG.debug("No LDAP group or custom filter checks are enabled; skipping.");
+        return;
+      }
+      
+      // Check if this is a proxy user - we don't apply LDAP filters to proxy users
+      String proxyUser = SessionManager.getProxyUserName();
+      if (proxyUser != null && !proxyUser.isEmpty()) {
+        LOG.debug("Skipping LDAP filters for proxy user: {}", proxyUser);
+        return;
+      }
+      String bindDN = hiveConf.getVar(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BIND_USER);
+      String bindPassword = null;
+      try {
+        char[] rawPassword = hiveConf.getPassword(HiveConf.ConfVars.HIVE_SERVER2_PLAIN_LDAP_BIND_PASSWORD.toString());
+        if (rawPassword != null) {
+          bindPassword = new String(rawPassword);
+        }
+      } catch (IOException e) {
+        LOG.debug("BindPassword is null.");
+      }
+      if (bindDN == null || bindDN.isEmpty() || bindPassword == null || bindPassword.isEmpty()) {
+        LOG.error("LDAP bind DN or password is not configured; skipping all checks!");
+        return;
+      }
+      boolean passedGroupCheck = !enableGroupCheck;
+      boolean passedCustomFilter = !allowCustomFilter;
+      try {
+        DirSearchFactory factory = new LdapSearchFactory();
+        DirSearch dirSearch = factory.getInstance(hiveConf, bindDN, bindPassword);
+        if (enableGroupCheck) {
+          passedGroupCheck = applyGroupFilter(dirSearch, shortName);
+        }
+        if (allowCustomFilter) {
+          passedCustomFilter = applyCustomFilter(dirSearch, shortName);
+        }
+      } catch (javax.security.sasl.AuthenticationException ae) {
+        LOG.warn("User {} encountered LDAP error: {}", shortName, ae.getMessage());
+        throw new HttpAuthenticationException("LDAP error for user " + shortName, ae);
+      }
+      if (!(passedGroupCheck && passedCustomFilter)) {
+        throw new HttpAuthenticationException("LDAP filter check failed for user " + shortName);
+      }
+    }
+
+    private boolean applyGroupFilter(DirSearch dirSearch, String shortName)
+        throws javax.security.sasl.AuthenticationException {
+      FilterFactory filterFactory = new UserGroupSearchFilterFactory();
+      Filter groupFilter = filterFactory.getInstance(hiveConf);
+      if (groupFilter == null) {
+        groupFilter = new GroupFilterFactory().getInstance(hiveConf);
+      }
+      if (groupFilter == null) {
+        LOG.warn("No LDAP group filter configured.");
+        return false;
+      }
+      try {
+        groupFilter.apply(dirSearch, shortName);
+        LOG.debug("Kerberos user {} passed the LDAP group filter.", shortName);
+        return true;
+      } catch (javax.security.sasl.AuthenticationException ae) {
+        LOG.warn("Kerberos user {} failed LDAP group filter: {}", shortName, ae.getMessage());
+        return false;
+      }
+    }
+    private boolean applyCustomFilter(DirSearch dirSearch, String shortName)
+        throws javax.security.sasl.AuthenticationException {
+      FilterFactory customFilterFactory = new CustomQueryFilterFactory();
+      Filter customFilter = customFilterFactory.getInstance(hiveConf);
+      if (customFilter == null) {
+        LOG.warn("No custom LDAP filter configured. Skipping custom filter check for user {}", shortName);
+        return true;
+      }
+      try {
+        customFilter.apply(dirSearch, shortName);
+        LOG.debug("Kerberos user {} passed the custom LDAP filter.", shortName);
+        return true;
+      } catch (javax.security.sasl.AuthenticationException ae) {
+        LOG.warn("Kerberos user {} failed the custom LDAP filter: {}", shortName, ae.getMessage());
+        return false;
       }
     }
 
